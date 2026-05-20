@@ -11,32 +11,33 @@ pub struct FastBrain {
 
 #[pymethods]
 impl FastBrain {
-    /// Create a new FastBrain instance.
+    /// Create a new FastBrain instance with optional custom dimensions.
     #[new]
-    pub fn new() -> Self {
+    #[pyo3(signature = (num_inputs = 24, num_hidden = 36, num_outputs = 4))]
+    pub fn new(num_inputs: usize, num_hidden: usize, num_outputs: usize) -> Self {
         let telemetry = TelemetryHub::new();
         // Start the background telemetry loop (Simulated telemetry server thread)
         telemetry.start_background_loop();
         
         Self {
-            inner: CoreFastBrain::new(),
+            inner: CoreFastBrain::new(num_inputs, num_hidden, num_outputs),
             telemetry,
         }
     }
 
-    /// Ingests 24 sensor input observations from Python, triggers SNN propagation
-    /// to compute the 4 continuous motor actions, pushes the spikes bitmask
+    /// Ingests sensor input observations from Python, triggers SNN propagation
+    /// to compute the continuous motor actions, pushes the spikes bitmask
     /// to telemetry, and returns the actions.
     pub fn tick(&mut self, inputs: Vec<f32>) -> PyResult<Vec<f32>> {
-        if inputs.len() != 24 {
+        if inputs.len() != self.inner.num_inputs {
             return Err(pyo3::exceptions::PyValueError::new_err(
-                format!("FastBrain requires exactly 24 inputs, got {}", inputs.len())
+                format!("FastBrain requires exactly {} inputs, got {}", self.inner.num_inputs, inputs.len())
             ));
         }
 
-        // 1. Python says: "Here is the state of BipedalWalker (24 floats)"
+        // 1. Python says: "Here is the state of the environment (floats)"
         // 2. PyO3 passes it directly to core_engine in RAM
-        // 3. FastBrain calculates spike propagation and computes the 4 actions
+        // 3. FastBrain calculates spike propagation and computes actions
         let actions = self.inner.tick(&inputs);
 
         // 4. FastBrain pushes the active neurons bitmask to the telemetry hub
