@@ -5,14 +5,26 @@ import time
 import numpy as np
 import gymnasium as gym
 
+# Reconfigure stdout/stderr to use UTF-8 on Windows command prompts to prevent UnicodeEncodeErrors
+if sys.platform == "win32":
+    try:
+        sys.stdout.reconfigure(encoding="utf-8")
+        sys.stderr.reconfigure(encoding="utf-8")
+    except AttributeError:
+        pass
+
 # Ensure we can import the compiled python_bridge from the virtual environment
 try:
     import python_bridge
+    if not hasattr(python_bridge, "FastBrain"):
+        raise ImportError("python_bridge was imported but does not contain FastBrain. It might be a namespace package.")
 except ImportError:
     # Fallback to check parent directories if needed
     sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
     try:
         import python_bridge
+        if not hasattr(python_bridge, "FastBrain"):
+            raise ImportError("python_bridge was imported from parent but does not contain FastBrain.")
     except ImportError as e:
         print("❌ Error: python_bridge is not installed or compiled. Please run 'maturin develop' first.")
         print(e)
