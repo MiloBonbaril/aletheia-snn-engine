@@ -3,6 +3,7 @@
 /// FastBrain represents a zero-allocation, high-performance Spiking Neural Network.
 /// It uses a Struct of Arrays (SoA) memory layout for neuron state and a
 /// Compressed Sparse Row (CSR) layout for synaptic connections to optimize CPU cache performance.
+#[derive(Clone, Debug)]
 pub struct FastBrain {
     /// Number of input neurons (sensors).
     pub num_inputs: usize,
