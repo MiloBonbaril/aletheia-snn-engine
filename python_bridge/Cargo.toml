@@ -1,0 +1,12 @@
+[package]
+name = "python_bridge"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "python_bridge"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.21", features = ["extension-module"] }
+core_engine = { path = "../core_engine" }
