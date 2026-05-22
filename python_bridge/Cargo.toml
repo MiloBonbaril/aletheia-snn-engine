@@ -11,3 +11,9 @@ crate-type = ["cdylib"]
 pyo3 = { version = "0.21", features = ["extension-module"] }
 core_engine = { path = "../core_engine" }
 arc-swap = "1.7"
+rand = "0.8"
+rayon = "1.10"
+
+[features]
+default = []
+cuda = ["core_engine/cuda"]

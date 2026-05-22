@@ -102,22 +102,39 @@ pub mod cuda {
 
     /// CudaSnnSolver orchestrates the offloading of SNN propagation batches to the GPU.
     pub struct CudaSnnSolver {
-        device: Arc<CudaDevice>,
-        function: CudaFunction,
+        pub device: Arc<CudaDevice>,
+        pub function: CudaFunction,
+        pub eval_function: CudaFunction,
+        pub reduce_function: CudaFunction,
     }
 
     impl CudaSnnSolver {
-        /// Initializes the CUDA solver, loads the custom compiled PTX module, and gets the kernel function.
-        pub fn new() -> Result<Self, cudarc::driver::driver_error::DriverError> {
+        /// Initializes the CUDA solver, loads the custom compiled PTX module, and gets the kernel functions.
+        pub fn new() -> Result<Self, cudarc::driver::DriverError> {
             let device = CudaDevice::new(0)?;
             
             // Load the PTX compiled during the build phase
             let ptx_src = include_str!(concat!(env!("OUT_DIR"), "/snn_kernel.ptx"));
             
-            device.load_ptx(ptx_src.into(), "snn_module", &["compute_snn_kernel"])?;
+            device.load_ptx(
+                ptx_src.into(),
+                "snn_module",
+                &[
+                    "compute_snn_kernel",
+                    "evaluate_phantom_mutants_kernel",
+                    "find_champion_kernel",
+                ],
+            )?;
             let function = device.get_func("snn_module", "compute_snn_kernel").unwrap();
+            let eval_function = device.get_func("snn_module", "evaluate_phantom_mutants_kernel").unwrap();
+            let reduce_function = device.get_func("snn_module", "find_champion_kernel").unwrap();
 
-            Ok(Self { device, function })
+            Ok(Self {
+                device,
+                function,
+                eval_function,
+                reduce_function,
+            })
         }
 
         /// Simulates a single tick for a batch of clones in parallel on the GPU.
@@ -135,7 +152,7 @@ pub mod cuda {
             neuron_offsets: &[u32],
             thresholds: &[f32],
             beta: f32,
-        ) -> Result<(), cudarc::driver::driver_error::DriverError> {
+        ) -> Result<(), cudarc::driver::DriverError> {
             // Allocate and transfer CPU arrays to GPU VRAM (device memory)
             let mut dev_potentials = self.device.htod_copy(membrane_potentials.to_vec())?;
             let mut dev_spike_out = self.device.alloc_zeros::<i32>(num_clones * num_neurons)?;
@@ -189,6 +206,289 @@ pub mod cuda {
             spike_out.copy_from_slice(&computed_spikes);
 
             Ok(())
+        }
+
+        /// Simulates a batch of mutant SNN clones sequentially on the circular Replay Buffer
+        /// and finds the best mutant clone ID along with its fitness score.
+        pub fn evaluate_phantom_mutants(
+            &self,
+            parent: &FastBrain,
+            replay_buffer: &crate::arena::PhantomReplayBuffer,
+            mutated_weights: &[f32], // Flat vector of size num_clones * num_synapses
+            num_clones: usize,
+        ) -> Result<(usize, f32), cudarc::driver::DriverError> {
+            if num_clones == 0 {
+                return Ok((0, 0.0));
+            }
+
+            let num_neurons = parent.active_neurons;
+            let num_synapses = parent.synapse_weights.len();
+
+            // Circular buffer variables
+            let capacity = replay_buffer.capacity;
+            let count = replay_buffer.count;
+            let write_idx = replay_buffer.write_idx;
+            let oldest_idx = if count < capacity { 0 } else { write_idx };
+            let history_len = count;
+
+            if history_len == 0 {
+                return Ok((0, 0.0));
+            }
+
+            // 1. Pack and transfer variables to GPU VRAM
+            // Dims array: size 10
+            let decay_bits = parent.decay.to_bits() as i32;
+            let dims = [
+                parent.num_inputs as i32,
+                parent.num_hidden as i32,
+                parent.num_outputs as i32,
+                num_neurons as i32,
+                num_clones as i32,
+                num_synapses as i32,
+                history_len as i32,
+                oldest_idx as i32,
+                capacity as i32,
+                decay_bits,
+            ];
+            let dev_dims = self.device.htod_copy(dims.to_vec())?;
+
+            // Transfer inputs, actions, rewards
+            let dev_inputs = self.device.htod_copy(replay_buffer.inputs.clone())?;
+            let dev_actions = self.device.htod_copy(replay_buffer.actions.clone())?;
+            let dev_rewards = self.device.htod_copy(replay_buffer.rewards.clone())?;
+            let dev_weights = self.device.htod_copy(mutated_weights.to_vec())?;
+
+            // Topology (offsets + targets) packed in a single contiguous i32 array
+            let targets_i32: Vec<i32> = parent.synapse_targets.iter().map(|&x| x as i32).collect();
+            let offsets_i32: Vec<i32> = parent.neuron_offsets.iter().map(|&x| x as i32).collect();
+            let mut topology_data = Vec::with_capacity(offsets_i32.len() + targets_i32.len());
+            topology_data.extend_from_slice(&offsets_i32);
+            topology_data.extend_from_slice(&targets_i32);
+            let dev_topology = self.device.htod_copy(topology_data)?;
+
+            // Neuron params (thresholds + biases) packed in a single contiguous f32 array
+            let mut neuron_params = Vec::with_capacity(parent.thresholds.len() + parent.biases.len());
+            neuron_params.extend_from_slice(&parent.thresholds);
+            neuron_params.extend_from_slice(&parent.biases);
+            let dev_neuron_params = self.device.htod_copy(neuron_params)?;
+
+            // 2. Allocate workspace memory on GPU VRAM
+            // Single contiguous workspace array of size 4 * num_clones * num_neurons
+            let mut dev_fitness = self.device.alloc_zeros::<f32>(num_clones)?;
+            let mut dev_workspace = self.device.alloc_zeros::<f32>(4 * num_clones * num_neurons)?;
+
+            // 3. Launch Simulation Kernel
+            let threads_per_block = 256;
+            let blocks = (num_clones + threads_per_block - 1) / threads_per_block;
+            let eval_config = LaunchConfig {
+                grid_dim: (blocks as u32, 1, 1),
+                block_dim: (threads_per_block as u32, 1, 1),
+                shared_mem_bytes: 0,
+            };
+
+            unsafe {
+                self.eval_function.clone().launch(
+                    eval_config,
+                    (
+                        &dev_dims,
+                        &dev_inputs,
+                        &dev_actions,
+                        &dev_rewards,
+                        &dev_weights,
+                        &dev_topology,
+                        &dev_neuron_params,
+                        &mut dev_fitness,
+                        &mut dev_workspace,
+                    ),
+                )?;
+            }
+
+            // 4. Find the champion: Use GPU reduction if num_clones <= 1024, else fallback to CPU max
+            let champion_id;
+            let max_fitness;
+
+            if num_clones <= 1024 {
+                let mut dev_max_fitness = self.device.alloc_zeros::<f32>(1)?;
+                let mut dev_champion_id = self.device.alloc_zeros::<i32>(1)?;
+
+                let reduce_config = LaunchConfig {
+                    grid_dim: (1, 1, 1),
+                    block_dim: (1024, 1, 1),
+                    shared_mem_bytes: 0,
+                };
+
+                unsafe {
+                    self.reduce_function.clone().launch(
+                        reduce_config,
+                        (
+                            &dev_fitness,
+                            num_clones as i32,
+                            &mut dev_max_fitness,
+                            &mut dev_champion_id,
+                        ),
+                    )?;
+                }
+
+                let max_fitness_vec = self.device.sync_reclaim(dev_max_fitness)?;
+                let champion_id_vec = self.device.sync_reclaim(dev_champion_id)?;
+                champion_id = champion_id_vec[0] as usize;
+                max_fitness = max_fitness_vec[0];
+            } else {
+                let fitness_vec = self.device.sync_reclaim(dev_fitness)?;
+                let (best_idx, &best_fit) = fitness_vec
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or((0, &0.0));
+                champion_id = best_idx;
+                max_fitness = best_fit;
+            }
+
+            Ok((champion_id, max_fitness))
+        }
+    }
+}
+
+#[cfg(all(test, feature = "cuda"))]
+mod tests {
+    use super::cuda::CudaSnnSolver;
+    use crate::brain::FastBrain;
+    use crate::arena::PhantomReplayBuffer;
+    use cudarc::driver::LaunchAsync;
+
+    #[test]
+    fn test_gpu_cpu_mathematical_parity() {
+        let num_inputs = 3;
+        let num_hidden = 4;
+        let num_outputs = 2;
+        let capacity = 5;
+        let num_clones = 3;
+
+        let mut parent = FastBrain::new(num_inputs, num_hidden, num_outputs);
+        // Ensure STDP is not interfering or let it adapt
+        parent.stdp_a_plus = 0.0;
+        parent.stdp_a_minus = 0.0;
+
+        let mut buffer = PhantomReplayBuffer::new(num_inputs, num_outputs, capacity);
+        // Fill buffer with deterministic dummy data
+        for i in 0..capacity {
+            let input = vec![0.1 * i as f32, -0.2 * i as f32, 0.5];
+            let action = vec![(i as f32 * 0.1).tanh(), (i as f32 * -0.15).tanh()];
+            let reward = 1.5 + (i as f32 * 0.2);
+            buffer.add_frame(&input, &action, reward);
+        }
+
+        // Generate mutated weights
+        let num_synapses = parent.synapse_weights.len();
+        let mut mutated_weights = vec![0.0; num_clones * num_synapses];
+        for c in 0..num_clones {
+            let offset = c * num_synapses;
+            for i in 0..num_synapses {
+                let w = parent.synapse_weights[i] + (c as f32 * 0.1) - (i as f32 * 0.05);
+                mutated_weights[offset + i] = w;
+            }
+        }
+
+        // 1. Evaluate on GPU
+        let solver = CudaSnnSolver::new().expect("Failed to initialize CudaSnnSolver");
+        
+        let num_neurons = parent.active_neurons;
+        let oldest_idx = if buffer.count < capacity { 0 } else { buffer.write_idx };
+        let history_len = buffer.count;
+
+        let dev_inputs = solver.device.htod_copy(buffer.inputs.clone()).unwrap();
+        let dev_actions = solver.device.htod_copy(buffer.actions.clone()).unwrap();
+        let dev_rewards = solver.device.htod_copy(buffer.rewards.clone()).unwrap();
+        let dev_weights = solver.device.htod_copy(mutated_weights.clone()).unwrap();
+
+        let targets_i32: Vec<i32> = parent.synapse_targets.iter().map(|&x| x as i32).collect();
+        let offsets_i32: Vec<i32> = parent.neuron_offsets.iter().map(|&x| x as i32).collect();
+        let mut topology_data = Vec::new();
+        topology_data.extend_from_slice(&offsets_i32);
+        topology_data.extend_from_slice(&targets_i32);
+        let dev_topology = solver.device.htod_copy(topology_data).unwrap();
+
+        let mut neuron_params = Vec::new();
+        neuron_params.extend_from_slice(&parent.thresholds);
+        neuron_params.extend_from_slice(&parent.biases);
+        let dev_neuron_params = solver.device.htod_copy(neuron_params).unwrap();
+
+        let mut dev_fitness = solver.device.alloc_zeros::<f32>(num_clones).unwrap();
+        let mut dev_workspace = solver.device.alloc_zeros::<f32>(4 * num_clones * num_neurons).unwrap();
+
+        let decay_bits = parent.decay.to_bits() as i32;
+        let dims = [
+            num_inputs as i32,
+            num_hidden as i32,
+            num_outputs as i32,
+            num_neurons as i32,
+            num_clones as i32,
+            num_synapses as i32,
+            history_len as i32,
+            oldest_idx as i32,
+            capacity as i32,
+            decay_bits,
+        ];
+        let dev_dims = solver.device.htod_copy(dims.to_vec()).unwrap();
+
+        let config = cudarc::driver::LaunchConfig {
+            grid_dim: (1, 1, 1),
+            block_dim: (num_clones as u32, 1, 1),
+            shared_mem_bytes: 0,
+        };
+
+        unsafe {
+            solver.eval_function.clone().launch(
+                config,
+                (
+                    &dev_dims,
+                    &dev_inputs,
+                    &dev_actions,
+                    &dev_rewards,
+                    &dev_weights,
+                    &dev_topology,
+                    &dev_neuron_params,
+                    &mut dev_fitness,
+                    &mut dev_workspace,
+                ),
+            ).unwrap();
+        }
+
+        let gpu_fitness_results = solver.device.sync_reclaim(dev_fitness).unwrap();
+
+        // 2. Evaluate on CPU (sequential reference)
+        let mut cpu_fitnesses = vec![0.0; num_clones];
+        for c in 0..num_clones {
+            let mut clone = parent.clone();
+            let offset = c * num_synapses;
+            clone.synapse_weights.copy_from_slice(&mutated_weights[offset..(offset + num_synapses)]);
+            clone.activations.fill(0.0);
+            clone.last_spikes.fill(false);
+
+            let mut fitness = 0.0;
+            for t in 0..history_len {
+                let frame_idx = (oldest_idx + t) % capacity;
+                let input_start = frame_idx * num_inputs;
+                let input = &buffer.inputs[input_start..(input_start + num_inputs)];
+                let action_hist = &buffer.actions[(frame_idx * num_outputs)..(frame_idx * num_outputs + num_outputs)];
+                let reward = buffer.rewards[frame_idx];
+
+                let actions = clone.tick(input);
+
+                let mut frame_dot = 0.0;
+                for o in 0..num_outputs {
+                    frame_dot += actions[o] * action_hist[o];
+                }
+                fitness += reward * frame_dot;
+            }
+            cpu_fitnesses[c] = fitness;
+        }
+
+        // Compare GPU vs CPU fitnesses
+        for c in 0..num_clones {
+            let diff = (gpu_fitness_results[c] - cpu_fitnesses[c]).abs();
+            println!("Clone {}: GPU = {}, CPU = {}, Diff = {}", c, gpu_fitness_results[c], cpu_fitnesses[c], diff);
+            assert!(diff < 1e-4, "Clone {} fitness does not match! GPU: {}, CPU: {}", c, gpu_fitness_results[c], cpu_fitnesses[c]);
         }
     }
 }

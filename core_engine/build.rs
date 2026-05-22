@@ -12,11 +12,18 @@ fn main() {
 
         println!("cargo:warning=Compiling CUDA SNN kernel via nvcc to PTX: {:?}", dest_path);
 
+        let msvc_path = "C:\\Program Files\\Microsoft Visual Studio\\2022\\Community\\VC\\Tools\\MSVC\\14.44.35207\\bin\\Hostx64\\x64";
+        let mut path = std::env::var("PATH").unwrap_or_default();
+        if !path.contains(msvc_path) {
+            path = format!("{};{}", msvc_path, path);
+        }
+
         let status = Command::new("nvcc")
+            .env("PATH", path)
             .args(&[
                 "-ptx",
                 "-O3",
-                "-arch=sm_52", // Safe baseline architecture supporting most NVIDIA GPUs
+                "-arch=sm_75", // Safe baseline architecture supporting most modern NVIDIA GPUs
                 "src/snn_kernel.cu",
                 "-o",
                 dest_path.to_str().unwrap(),

@@ -1,4 +1,5 @@
 // CSR (Compressed Sparse Row) matrix structure and SNN inference engine
+use serde::{Serialize, Deserialize};
 
 /// FastBrain represents a zero-allocation, high-performance Spiking Neural Network.
 /// It uses a Struct of Arrays (SoA) memory layout for neuron state and a
@@ -40,6 +41,22 @@ pub struct FastBrain {
     /// Index in synapse arrays where each neuron's outgoing connections begin.
     /// Size is active_neurons + 1.
     pub neuron_offsets: Vec<u32>,
+
+    // STDP learning trace buffers (SoA format)
+    /// STDP pre-synaptic traces for all neurons.
+    pub pre_traces: Vec<f32>,
+    /// STDP post-synaptic traces for all neurons.
+    pub post_traces: Vec<f32>,
+
+    // STDP learning parameters
+    /// Pre-synaptic trace decay time constant in ticks.
+    pub stdp_tau_pre: f32,
+    /// Post-synaptic trace decay time constant in ticks.
+    pub stdp_tau_post: f32,
+    /// LTP learning rate.
+    pub stdp_a_plus: f32,
+    /// LTD learning rate.
+    pub stdp_a_minus: f32,
 }
 
 impl FastBrain {
@@ -132,6 +149,12 @@ impl FastBrain {
             synapse_weights,
             synapse_targets,
             neuron_offsets,
+            pre_traces: vec![0.0; active_neurons],
+            post_traces: vec![0.0; active_neurons],
+            stdp_tau_pre: 20.0,
+            stdp_tau_post: 20.0,
+            stdp_a_plus: 0.005,
+            stdp_a_minus: 0.006,
         }
     }
 
@@ -232,6 +255,50 @@ impl FastBrain {
         // Save current spikes for recurrent step next tick
         self.last_spikes.copy_from_slice(&self.current_spikes);
 
+        // --- STDP (Spike-Timing-Dependent Plasticity) Trace-Based Learning ---
+        // 1. Decay all traces exponentially: x_i <- x_i * exp(-1 / tau)
+        let decay_pre = (-1.0 / self.stdp_tau_pre).exp();
+        let decay_post = (-1.0 / self.stdp_tau_post).exp();
+        for i in 0..self.active_neurons {
+            self.pre_traces[i] *= decay_pre;
+            self.post_traces[i] *= decay_post;
+            
+            // 2. If the neuron spiked in the current tick, set its trace to 1.0
+            if self.current_spikes[i] {
+                self.pre_traces[i] = 1.0;
+                self.post_traces[i] = 1.0;
+            }
+        }
+
+        // 3. Update synaptic weights using pre/post spikes and traces
+        for j in 0..self.active_neurons {
+            let start = self.neuron_offsets[j] as usize;
+            let end = self.neuron_offsets[j + 1] as usize;
+            let pre_spike = self.current_spikes[j];
+
+            for idx in start..end {
+                let i = self.synapse_targets[idx] as usize;
+                let post_spike = self.current_spikes[i];
+
+                // LTD: Pre-synaptic spike occurs, post-synaptic neuron was active recently
+                if pre_spike {
+                    self.synapse_weights[idx] -= self.stdp_a_minus * self.post_traces[i];
+                }
+                
+                // LTP: Post-synaptic spike occurs, pre-synaptic neuron was active recently
+                if post_spike {
+                    self.synapse_weights[idx] += self.stdp_a_plus * self.pre_traces[j];
+                }
+
+                // Clip weight to prevent divergence (e.g. keep within [-2.0, 2.0])
+                if self.synapse_weights[idx] > 2.0 {
+                    self.synapse_weights[idx] = 2.0;
+                } else if self.synapse_weights[idx] < -2.0 {
+                    self.synapse_weights[idx] = -2.0;
+                }
+            }
+        }
+
         // Map output membrane potentials to continuous motor actions in [-1.0, 1.0] via tanh
         let mut actions = vec![0.0; self.num_outputs];
         for i in 0..self.num_outputs {
@@ -239,6 +306,148 @@ impl FastBrain {
         }
 
         actions
+    }
+
+    /// Prunes synapses whose absolute weight is below the threshold (e.g. 1e-4).
+    /// Reconstructs the CSR index offsets in-place to avoid vector allocation fragmentation.
+    pub fn prune_synapses(&mut self) {
+        let threshold = 1e-4f32;
+        let mut new_weights = Vec::with_capacity(self.synapse_weights.len());
+        let mut new_targets = Vec::with_capacity(self.synapse_targets.len());
+        let mut new_offsets = Vec::with_capacity(self.neuron_offsets.len());
+
+        new_offsets.push(0);
+
+        for j in 0..self.active_neurons {
+            let start = self.neuron_offsets[j] as usize;
+            let end = self.neuron_offsets[j + 1] as usize;
+
+            for idx in start..end {
+                let w = self.synapse_weights[idx];
+                let target = self.synapse_targets[idx];
+                if w.abs() >= threshold {
+                    new_weights.push(w);
+                    new_targets.push(target);
+                }
+            }
+            new_offsets.push(new_weights.len() as u32);
+        }
+
+        self.synapse_weights = new_weights;
+        self.synapse_targets = new_targets;
+        self.neuron_offsets = new_offsets;
+    }
+
+    /// Dynamically connects two active neurons in the CSR structure with the given weight.
+    /// If the connection already exists, its weight is updated.
+    pub fn add_synapse(&mut self, src: usize, dst: usize, weight: f32) {
+        if src >= self.active_neurons || dst >= self.active_neurons {
+            return;
+        }
+
+        // Check if connection already exists
+        let start = self.neuron_offsets[src] as usize;
+        let end = self.neuron_offsets[src + 1] as usize;
+        for idx in start..end {
+            if self.synapse_targets[idx] == dst as u32 {
+                self.synapse_weights[idx] = weight;
+                return;
+            }
+        }
+
+        // Insert at the end of the outgoing synapses for `src`
+        self.synapse_weights.insert(end, weight);
+        self.synapse_targets.insert(end, dst as u32);
+
+        // Shift offsets for all neurons after `src`
+        for o in (src + 1)..=self.active_neurons {
+            self.neuron_offsets[o] += 1;
+        }
+    }
+
+    /// Adds a new hidden neuron by waking it up from our preallocated Arena pools.
+    /// Returns the index of the newly created hidden neuron.
+    pub fn add_hidden_neuron(&mut self) -> usize {
+        let new_hidden_idx = self.num_inputs + self.num_hidden;
+        
+        // 1. Insert new elements into SoA arrays at new_hidden_idx
+        self.activations.insert(new_hidden_idx, 0.0);
+        self.thresholds.insert(new_hidden_idx, 1.0); // Default threshold
+        self.biases.insert(new_hidden_idx, 0.0);
+        self.last_spikes.insert(new_hidden_idx, false);
+        self.current_spikes.insert(new_hidden_idx, false);
+        self.inputs_accumulated.insert(new_hidden_idx, 0.0);
+        self.pre_traces.insert(new_hidden_idx, 0.0);
+        self.post_traces.insert(new_hidden_idx, 0.0);
+
+        // Update counts
+        self.num_hidden += 1;
+        self.active_neurons += 1;
+
+        // 2. We must insert a new entry in `neuron_offsets` at `new_hidden_idx`.
+        let offset = self.neuron_offsets[new_hidden_idx];
+        self.neuron_offsets.insert(new_hidden_idx, offset);
+
+        // 3. Since output neurons shifted their indices by 1,
+        // we must increment any target ID in `synapse_targets` that is >= new_hidden_idx by 1!
+        for target in &mut self.synapse_targets {
+            if *target >= new_hidden_idx as u32 {
+                *target += 1;
+            }
+        }
+
+        new_hidden_idx
+    }
+
+    /// Splits an existing synapse (src -> dst) by inserting a new hidden neuron C in between.
+    /// src -> C gets weight 1.0, C -> dst gets the original synapse weight.
+    /// The original synapse (src -> dst) is removed.
+    pub fn split_synapse(&mut self, synapse_idx: usize) {
+        if synapse_idx >= self.synapse_weights.len() {
+            return;
+        }
+
+        // Find the source neuron `src` of this synapse
+        let mut src = 0;
+        for j in 0..self.active_neurons {
+            let start = self.neuron_offsets[j] as usize;
+            let end = self.neuron_offsets[j + 1] as usize;
+            if synapse_idx >= start && synapse_idx < end {
+                src = j;
+                break;
+            }
+        }
+
+        let original_weight = self.synapse_weights[synapse_idx];
+        let original_target = self.synapse_targets[synapse_idx] as usize;
+
+        // 1. Remove the original synapse src -> dst
+        self.synapse_weights.remove(synapse_idx);
+        self.synapse_targets.remove(synapse_idx);
+
+        // Shift offsets for neurons after `src`
+        for o in (src + 1)..=self.active_neurons {
+            self.neuron_offsets[o] -= 1;
+        }
+
+        // 2. Adjust indices if they are affected by output neuron shifting
+        let mut adjusted_src = src;
+        let mut adjusted_target = original_target;
+        let new_hidden_idx = self.num_inputs + self.num_hidden;
+
+        if src >= new_hidden_idx {
+            adjusted_src += 1;
+        }
+        if original_target >= new_hidden_idx {
+            adjusted_target += 1;
+        }
+
+        // 3. Create the new hidden neuron
+        let new_neuron_idx = self.add_hidden_neuron();
+
+        // 4. Connect adjusted_src -> C and C -> adjusted_target
+        self.add_synapse(adjusted_src, new_neuron_idx, 1.0);
+        self.add_synapse(new_neuron_idx, adjusted_target, original_weight);
     }
 
     /// Exposes the current spikes bitmask packed into a u64 (first 64 neurons).
@@ -253,7 +462,108 @@ impl FastBrain {
         }
         mask
     }
+
+    pub fn to_state(&self) -> FastBrainState {
+        FastBrainState {
+            num_inputs: self.num_inputs,
+            num_hidden: self.num_hidden,
+            num_outputs: self.num_outputs,
+            active_neurons: self.active_neurons,
+            decay: self.decay,
+            thresholds: self.thresholds.clone(),
+            biases: self.biases.clone(),
+            synapse_weights: self.synapse_weights.clone(),
+            synapse_targets: self.synapse_targets.clone(),
+            neuron_offsets: self.neuron_offsets.clone(),
+            stdp_tau_pre: self.stdp_tau_pre,
+            stdp_tau_post: self.stdp_tau_post,
+            stdp_a_plus: self.stdp_a_plus,
+            stdp_a_minus: self.stdp_a_minus,
+        }
+    }
+
+    /// Reconstructs a FastBrain from a FastBrainState, allocating and initializing execution-only buffers.
+    pub fn from_state(state: FastBrainState) -> Self {
+        let active_neurons = state.active_neurons;
+        Self {
+            num_inputs: state.num_inputs,
+            num_hidden: state.num_hidden,
+            num_outputs: state.num_outputs,
+            active_neurons,
+            activations: vec![0.0; active_neurons],
+            thresholds: state.thresholds,
+            biases: state.biases,
+            decay: state.decay,
+            last_spikes: vec![false; active_neurons],
+            current_spikes: vec![false; active_neurons],
+            inputs_accumulated: vec![0.0; active_neurons],
+            synapse_weights: state.synapse_weights,
+            synapse_targets: state.synapse_targets,
+            neuron_offsets: state.neuron_offsets,
+            pre_traces: vec![0.0; active_neurons],
+            post_traces: vec![0.0; active_neurons],
+            stdp_tau_pre: state.stdp_tau_pre,
+            stdp_tau_post: state.stdp_tau_post,
+            stdp_a_plus: state.stdp_a_plus,
+            stdp_a_minus: state.stdp_a_minus,
+        }
+    }
+
+    /// Serializes the FastBrain into a pretty-printed JSON string.
+    pub fn to_json(&self) -> serde_json::Result<String> {
+        serde_json::to_string_pretty(&self.to_state())
+    }
+
+    /// Deserializes a FastBrain from a JSON string.
+    pub fn from_json(json_str: &str) -> serde_json::Result<Self> {
+        let state: FastBrainState = serde_json::from_str(json_str)?;
+        Ok(Self::from_state(state))
+    }
+
+    /// Saves the SNN state to a file on disk in pretty-printed JSON format.
+    pub fn save_to_file(&self, path: &str) -> std::io::Result<()> {
+        let json = self.to_json().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        std::fs::write(path, json)?;
+        Ok(())
+    }
+
+    /// Loads the SNN state from a file on disk in JSON format.
+    pub fn load_from_file(path: &str) -> std::io::Result<Self> {
+        let json = std::fs::read_to_string(path)?;
+        Self::from_json(&json).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    }
 }
+
+fn default_stdp_tau() -> f32 { 20.0 }
+fn default_stdp_a_plus() -> f32 { 0.005 }
+fn default_stdp_a_minus() -> f32 { 0.006 }
+
+/// A lightweight, serializable representation of a FastBrain's state.
+/// Holds only structural dimensions and learned parameters (weights, biases, thresholds),
+/// completely omitting dynamic and scratchpad vectors to avoid memory/file bloating.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct FastBrainState {
+    pub num_inputs: usize,
+    pub num_hidden: usize,
+    pub num_outputs: usize,
+    pub active_neurons: usize,
+    pub decay: f32,
+    pub thresholds: Vec<f32>,
+    pub biases: Vec<f32>,
+    pub synapse_weights: Vec<f32>,
+    pub synapse_targets: Vec<u32>,
+    pub neuron_offsets: Vec<u32>,
+    
+    #[serde(default = "default_stdp_tau")]
+    pub stdp_tau_pre: f32,
+    #[serde(default = "default_stdp_tau")]
+    pub stdp_tau_post: f32,
+    #[serde(default = "default_stdp_a_plus")]
+    pub stdp_a_plus: f32,
+    #[serde(default = "default_stdp_a_minus")]
+    pub stdp_a_minus: f32,
+}
+
 
 impl Default for FastBrain {
     /// Returns the default BipedalWalker-v3 brain architecture (24 inputs, 36 hidden, 4 outputs).
@@ -380,6 +690,8 @@ mod tests {
     fn test_dense_to_csr_mathematical_parity() {
         let mut legacy = LegacyDenseBrain::new();
         let mut csr = FastBrain::default();
+        csr.stdp_a_plus = 0.0;
+        csr.stdp_a_minus = 0.0;
 
         // Check if CSR conversion of synapse counts matches non-zero counts of legacy
         let legacy_non_zero = legacy.weights.iter().filter(|&&w| w != 0.0).count();
@@ -432,5 +744,114 @@ mod tests {
         for a in actions {
             assert!(a >= -1.0 && a <= 1.0);
         }
+    }
+
+    #[test]
+    fn test_stdp_learning_adaptation() {
+        let mut brain = FastBrain::new(1, 1, 1);
+        
+        // Let's set standard STDP learning parameters
+        brain.stdp_tau_pre = 10.0;
+        brain.stdp_tau_post = 10.0;
+        brain.stdp_a_plus = 0.05; // large learning rate to see effect quickly
+        brain.stdp_a_minus = 0.05;
+        
+        // Force the threshold of hidden neuron to be very low so it spikes easily
+        brain.thresholds[1] = 0.05;
+        brain.activations[1] = 0.0;
+
+        // Ensure there is a synapse from 0 (input) to 1 (hidden)
+        let mut found_synapse = false;
+        let start = brain.neuron_offsets[0] as usize;
+        let end = brain.neuron_offsets[1] as usize;
+        for idx in start..end {
+            if brain.synapse_targets[idx] == 1 {
+                found_synapse = true;
+                break;
+            }
+        }
+        
+        if !found_synapse {
+            // Force create a synapse in CSR format for this test
+            brain.synapse_weights.push(0.1);
+            brain.synapse_targets.push(1);
+            for o in 1..brain.neuron_offsets.len() {
+                brain.neuron_offsets[o] += 1;
+            }
+        }
+
+        // Retrieve initial weight of synapse 0 -> 1
+        let start = brain.neuron_offsets[0] as usize;
+        let end = brain.neuron_offsets[1] as usize;
+        let mut synapse_idx = 0;
+        for idx in start..end {
+            if brain.synapse_targets[idx] == 1 {
+                synapse_idx = idx;
+                break;
+            }
+        }
+
+        let initial_weight = brain.synapse_weights[synapse_idx];
+
+        // Tick several times with highly active input [1.0] to trigger spikes
+        for _ in 0..10 {
+            brain.tick(&[1.0]);
+        }
+
+        let final_weight = brain.synapse_weights[synapse_idx];
+        
+        // Verification: The weight should have mutated!
+        assert!(
+            (final_weight - initial_weight).abs() > 0.0,
+            "STDP failed to adapt weight! Initial: {}, Final: {}",
+            initial_weight,
+            final_weight
+        );
+    }
+
+    #[test]
+    fn test_dynamic_mutations() {
+        let mut brain = FastBrain::new(2, 2, 2);
+        let orig_neurons = brain.active_neurons;
+        
+        // Test add_synapse
+        brain.add_synapse(0, 3, 1.5);
+        let mut found = false;
+        let start = brain.neuron_offsets[0] as usize;
+        let end = brain.neuron_offsets[1] as usize;
+        for idx in start..end {
+            if brain.synapse_targets[idx] == 3 {
+                assert_eq!(brain.synapse_weights[idx], 1.5);
+                found = true;
+            }
+        }
+        assert!(found, "add_synapse failed to insert synapse!");
+
+        // Test add_hidden_neuron
+        let new_id = brain.add_hidden_neuron();
+        assert_eq!(brain.active_neurons, orig_neurons + 1);
+        assert_eq!(new_id, 4);
+
+        // Test split_synapse
+        let start = brain.neuron_offsets[0] as usize;
+        let end = brain.neuron_offsets[1] as usize;
+        let mut synapse_idx = None;
+        for idx in start..end {
+            if brain.synapse_targets[idx] == 3 {
+                synapse_idx = Some(idx);
+            }
+        }
+        
+        if let Some(s_idx) = synapse_idx {
+            let prev_synapses = brain.synapse_weights.len();
+            brain.split_synapse(s_idx);
+            assert_eq!(brain.synapse_weights.len(), prev_synapses + 1);
+        }
+
+        // Test prune_synapses
+        brain.add_synapse(1, 2, 1e-6);
+        let prev_len = brain.synapse_weights.len();
+        brain.prune_synapses();
+        assert!(brain.synapse_weights.len() < prev_len, "prune_synapses failed to prune weak synapse!");
     }
 }

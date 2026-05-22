@@ -5,10 +5,12 @@ edition = "2024"
 
 [features]
 default = []
-cuda = ["dep:cudarc"]
+cuda = ["dep:cudarc", "cudarc/cuda-12050"]
 
 [dependencies]
 arc-swap = "1.7"
 rand = "0.8"
 rayon = "1.10"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 cudarc = { version = "0.11", features = ["driver", "nvrtc"], optional = true }
